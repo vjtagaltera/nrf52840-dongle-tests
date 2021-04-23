@@ -2,7 +2,8 @@
 
 import serial.tools.list_ports
 import re
-import serial, threading, time
+import serial, threading, time, copy
+import sliplib
 
 
 def extract_vid_pid(info_string):
@@ -77,6 +78,14 @@ else:
 # adapt from serialtest1.py:
 
 class SerReader(threading.Thread):
+    def set_stop(self):
+        self._stop_requested = True
+    def wait_stopped(self):
+        for i in range(50):  # 50 * 20ms = 1sec
+            if self._stopped:
+                break
+            time.sleep(0.02) # 20ms
+
     def __init__(self, ser):
         super().__init__()
         self._ser = ser
@@ -84,6 +93,7 @@ class SerReader(threading.Thread):
         self._stopped = None
         self._stop_requested = None
         self._received_raw_bytes = bytearray(0)
+        self._returned_raw_bytes = bytearray(0)
 
     def run(self):
         while True:
@@ -101,7 +111,10 @@ class SerReader(threading.Thread):
                 break
         self._stopped = True
 
-    def get_data(self, timeout=1.0, up_to_bytes=512, up_to_char=b'\n'):
+    def get_data(self, timeout=1.0, up_to_bytes=512, up_to_char=None): # up_to_char=b'\n'
+        if len(self._received_raw_bytes) != len(self._returned_raw_bytes):
+            print("Discard bytes: ", " _received_raw_bytes", len(self._received_raw_bytes),
+                  " _returned_raw_bytes", len(self._returned_raw_bytes))
         self._received_raw_bytes = bytearray(0)
         tm0 = time.time()
         self._enable_read = True
@@ -109,7 +122,7 @@ class SerReader(threading.Thread):
         while True:
             dlen = len(self._received_raw_bytes)
             ending_char_found = False
-            if dlen > runcnt:
+            if dlen > runcnt and up_to_char is not None:
                 for i in range(runcnt, dlen):
                     runcnt = i+1
                     thechar = self._received_raw_bytes[i]
@@ -127,7 +140,8 @@ class SerReader(threading.Thread):
                 break
             time.sleep(0.010)
         self._enable_read = False
-        return self._received_raw_bytes
+        self._returned_raw_bytes = copy.deepcopy(self._received_raw_bytes)
+        return self._returned_raw_bytes
 
 
 port_file_name = '%s:' % working_port.port_name [0:5] # max 5 chars. so COM11: is COM11
@@ -144,7 +158,8 @@ for i in range(0, data_len, 5):
     data += data_seg
 data += "\n" # trigger sending on the nrf device
 
-data = b'\xC0' + data.encode() + b'\xC0' # 0xC0 is SLIP escape
+#data = b'\xC0' + data.encode() + b'\xC0' # 0xC0 is SLIP escape
+data = sliplib.encode(data.encode())
 print(" data len: ", len(data))
 
 tm0=time.time()
@@ -155,17 +170,44 @@ while True:
     tm2=time.time()
     if len(rv) > 0:
         print("  %.2f rv: " % ( tm2 - tm0 ), len(rv), rv)
+        ptr = 0
+        dlen = len(rv)
+        while ptr <= dlen:
+            idx = rv.find(sliplib.END, ptr)
+            if idx < 0:
+                rv = rv[ptr:]
+                print(" Drop: ", len(rv))
+                break
+            if idx >= 0:
+                if idx < dlen and idx >= ptr:
+                    pkt_raw = rv[ptr:idx+1]
+                    rlen = idx+1 - ptr
+                    if sliplib.is_valid(pkt_raw):
+                        pkt = sliplib.decode(pkt_raw)
+                        print(" Decoded: ", len(pkt), pkt)
+                    else:
+                        print(" Error decoding: ", len(pkt), pkt)
+                    ptr += rlen
+                else:
+                    print(" Error: searching for sliplib.END ")
+                    break
         if rv.find(data_seg.encode()) > 0:
             print("Data ending seg found")
             break
-    if tm2 - tm1 > 3:
+    if tm2 - tm1 > 12: # 12: test duration 12 seconds
         break
     time.sleep(0.010)
 
+rxthread.set_stop()
+tm3 = time.time()
+rxthread.wait_stopped()
+tm4 = time.time()
+
 ser.close()
 
+print("")
 print("  %.2f for write. %.2f to finish. rate %.3f " % (
         tm1-tm0, tm2-tm0, data_len*2/(tm2-tm0) ))
 print("  data written ", data)
-
+print("  wait_stop used %.2f" % (tm4-tm3))
 
